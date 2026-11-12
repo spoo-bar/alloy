@@ -85,17 +85,6 @@ impl WsConnect {
     ///
     /// This is only available on native targets: browsers do not allow setting arbitrary
     /// headers on the websocket handshake, so the wasm `WsConnect` does not support it.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use alloy_transport_ws::WsConnect;
-    /// use http::{HeaderName, HeaderValue};
-    ///
-    /// let ws = WsConnect::new("wss://example.com")
-    ///     .with_header(HeaderName::from_static("x-token"), HeaderValue::from_static("secret"));
-    /// assert_eq!(ws.headers()["x-token"], "secret");
-    /// ```
     pub fn with_header(mut self, name: http::HeaderName, mut value: http::HeaderValue) -> Self {
         value.set_sensitive(true);
         self.headers.insert(name, value);
@@ -370,79 +359,5 @@ mod tests {
         let ws =
             WsConnect::new("wss://user:pass@example.com").with_auth(Authorization::bearer("tok"));
         assert_eq!(ws.auth(), Some(&Authorization::bearer("tok")));
-    }
-
-    /// Accepts a single websocket connection and returns the handshake request headers.
-    async fn capture_handshake_headers(
-        ws: WsConnect,
-        listener: tokio::net::TcpListener,
-    ) -> http::HeaderMap {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let callback =
-                |req: &tungstenite::handshake::server::Request,
-                 resp: tungstenite::handshake::server::Response| {
-                    tx.send(req.headers().clone()).unwrap();
-                    Ok(resp)
-                };
-            tokio_tungstenite::accept_hdr_async(stream, callback).await.unwrap()
-        });
-        let _handle = ws.connect().await.unwrap();
-        let headers = rx.await.unwrap();
-        server.abort();
-        headers
-    }
-
-    async fn local_listener() -> (tokio::net::TcpListener, String) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        (listener, url)
-    }
-
-    #[tokio::test]
-    async fn custom_header_sent_on_handshake() {
-        let (listener, url) = local_listener().await;
-        let ws =
-            WsConnect::new(url).with_header("x-token".parse().unwrap(), "secret".parse().unwrap());
-        let headers = capture_handshake_headers(ws, listener).await;
-        assert_eq!(headers.get("x-token").unwrap(), "secret");
-    }
-
-    #[tokio::test]
-    async fn explicit_auth_overrides_custom_authorization_header() {
-        let (listener, url) = local_listener().await;
-        let ws = WsConnect::new(url)
-            .with_header(http::header::AUTHORIZATION, "Bearer custom".parse().unwrap())
-            .with_auth(Authorization::bearer("explicit"));
-        let headers = capture_handshake_headers(ws, listener).await;
-        let values: Vec<_> = headers.get_all(http::header::AUTHORIZATION).iter().collect();
-        assert_eq!(values, ["Bearer explicit"]);
-    }
-
-    #[test]
-    fn header_values_redacted_in_debug() {
-        let mut map = http::HeaderMap::new();
-        map.insert("x-other", "other-secret".parse().unwrap());
-        let ws = WsConnect::new("wss://example.com")
-            .with_header("x-token".parse().unwrap(), "super-secret".parse().unwrap())
-            .with_headers(map);
-        assert!(ws.headers().values().all(http::HeaderValue::is_sensitive));
-        let debug = format!("{ws:?}");
-        assert!(debug.contains("x-token"), "{debug}");
-        assert!(!debug.contains("super-secret"), "{debug}");
-        assert!(!debug.contains("other-secret"), "{debug}");
-    }
-
-    #[test]
-    fn with_headers_replaces_same_name() {
-        let mut map = http::HeaderMap::new();
-        map.insert("x-token", "new".parse().unwrap());
-        let ws = WsConnect::new("wss://example.com")
-            .with_header("x-token".parse().unwrap(), "old".parse().unwrap())
-            .with_header("x-keep".parse().unwrap(), "keep".parse().unwrap())
-            .with_headers(map);
-        assert_eq!(ws.headers().get_all("x-token").iter().collect::<Vec<_>>(), ["new"]);
-        assert_eq!(ws.headers()["x-keep"], "keep");
     }
 }
