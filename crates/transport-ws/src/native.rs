@@ -21,6 +21,10 @@ pub struct WsConnect {
     url: String,
     /// The authorization header to use.
     auth: Option<Authorization>,
+    /// Additional headers to send with the handshake request.
+    ///
+    /// All values are marked as sensitive, so they are redacted in `Debug` output.
+    headers: http::HeaderMap,
     /// The websocket config.
     config: Option<WebSocketConfig>,
     /// Max number of retries before failing and exiting the connection.
@@ -48,6 +52,7 @@ impl WsConnect {
         Self {
             url,
             auth,
+            headers: http::HeaderMap::new(),
             config: None,
             max_retries: 10,
             retry_interval: Duration::from_secs(3),
@@ -69,6 +74,49 @@ impl WsConnect {
         self
     }
 
+    /// Sets a custom HTTP header to send with the websocket handshake request.
+    ///
+    /// This replaces any header previously set with the same name. The value is marked as
+    /// sensitive, so it is redacted in `Debug` output.
+    ///
+    /// Headers set here are applied before the [`Authorization`] header, so an explicit
+    /// [`with_auth`](Self::with_auth) (or credentials in the URL) take precedence over a custom
+    /// `authorization` header.
+    ///
+    /// This is only available on native targets: browsers do not allow setting arbitrary
+    /// headers on the websocket handshake, so the wasm `WsConnect` does not support it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use alloy_transport_ws::WsConnect;
+    /// use http::{HeaderName, HeaderValue};
+    ///
+    /// let ws = WsConnect::new("wss://example.com")
+    ///     .with_header(HeaderName::from_static("x-token"), HeaderValue::from_static("secret"));
+    /// assert_eq!(ws.headers()["x-token"], "secret");
+    /// ```
+    pub fn with_header(mut self, name: http::HeaderName, mut value: http::HeaderValue) -> Self {
+        value.set_sensitive(true);
+        self.headers.insert(name, value);
+        self
+    }
+
+    /// Extends the custom HTTP headers sent with the websocket handshake request.
+    ///
+    /// For each header name present in `headers`, any values previously set for that name are
+    /// replaced. All values are marked as sensitive, so they are redacted in `Debug` output.
+    ///
+    /// See [`with_header`](Self::with_header) for how these interact with [`Authorization`] and
+    /// for platform support.
+    pub fn with_headers(mut self, mut headers: http::HeaderMap) -> Self {
+        for value in headers.values_mut() {
+            value.set_sensitive(true);
+        }
+        self.headers.extend(headers);
+        self
+    }
+
     /// Sets the websocket config.
     pub const fn with_config(mut self, config: WebSocketConfig) -> Self {
         self.config = Some(config);
@@ -83,6 +131,11 @@ impl WsConnect {
     /// Get the authorization header.
     pub const fn auth(&self) -> Option<&Authorization> {
         self.auth.as_ref()
+    }
+
+    /// Get the custom HTTP headers sent with the websocket handshake request.
+    pub const fn headers(&self) -> &http::HeaderMap {
+        &self.headers
     }
 
     /// Get the websocket config.
@@ -122,6 +175,8 @@ impl WsConnect {
 impl IntoClientRequest for WsConnect {
     fn into_client_request(self) -> tungstenite::Result<tungstenite::handshake::client::Request> {
         let mut request: http::Request<()> = self.url.into_client_request()?;
+        // Custom headers go first so that an explicit `auth` overrides a custom `authorization`.
+        request.headers_mut().extend(self.headers);
         if let Some(auth) = self.auth {
             let mut auth_value = http::HeaderValue::from_str(&auth.to_string())?;
             auth_value.set_sensitive(true);
@@ -315,5 +370,79 @@ mod tests {
         let ws =
             WsConnect::new("wss://user:pass@example.com").with_auth(Authorization::bearer("tok"));
         assert_eq!(ws.auth(), Some(&Authorization::bearer("tok")));
+    }
+
+    /// Accepts a single websocket connection and returns the handshake request headers.
+    async fn capture_handshake_headers(
+        ws: WsConnect,
+        listener: tokio::net::TcpListener,
+    ) -> http::HeaderMap {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let callback =
+                |req: &tungstenite::handshake::server::Request,
+                 resp: tungstenite::handshake::server::Response| {
+                    tx.send(req.headers().clone()).unwrap();
+                    Ok(resp)
+                };
+            tokio_tungstenite::accept_hdr_async(stream, callback).await.unwrap()
+        });
+        let _handle = ws.connect().await.unwrap();
+        let headers = rx.await.unwrap();
+        server.abort();
+        headers
+    }
+
+    async fn local_listener() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    #[tokio::test]
+    async fn custom_header_sent_on_handshake() {
+        let (listener, url) = local_listener().await;
+        let ws =
+            WsConnect::new(url).with_header("x-token".parse().unwrap(), "secret".parse().unwrap());
+        let headers = capture_handshake_headers(ws, listener).await;
+        assert_eq!(headers.get("x-token").unwrap(), "secret");
+    }
+
+    #[tokio::test]
+    async fn explicit_auth_overrides_custom_authorization_header() {
+        let (listener, url) = local_listener().await;
+        let ws = WsConnect::new(url)
+            .with_header(http::header::AUTHORIZATION, "Bearer custom".parse().unwrap())
+            .with_auth(Authorization::bearer("explicit"));
+        let headers = capture_handshake_headers(ws, listener).await;
+        let values: Vec<_> = headers.get_all(http::header::AUTHORIZATION).iter().collect();
+        assert_eq!(values, ["Bearer explicit"]);
+    }
+
+    #[test]
+    fn header_values_redacted_in_debug() {
+        let mut map = http::HeaderMap::new();
+        map.insert("x-other", "other-secret".parse().unwrap());
+        let ws = WsConnect::new("wss://example.com")
+            .with_header("x-token".parse().unwrap(), "super-secret".parse().unwrap())
+            .with_headers(map);
+        assert!(ws.headers().values().all(http::HeaderValue::is_sensitive));
+        let debug = format!("{ws:?}");
+        assert!(debug.contains("x-token"), "{debug}");
+        assert!(!debug.contains("super-secret"), "{debug}");
+        assert!(!debug.contains("other-secret"), "{debug}");
+    }
+
+    #[test]
+    fn with_headers_replaces_same_name() {
+        let mut map = http::HeaderMap::new();
+        map.insert("x-token", "new".parse().unwrap());
+        let ws = WsConnect::new("wss://example.com")
+            .with_header("x-token".parse().unwrap(), "old".parse().unwrap())
+            .with_header("x-keep".parse().unwrap(), "keep".parse().unwrap())
+            .with_headers(map);
+        assert_eq!(ws.headers().get_all("x-token").iter().collect::<Vec<_>>(), ["new"]);
+        assert_eq!(ws.headers()["x-keep"], "keep");
     }
 }
